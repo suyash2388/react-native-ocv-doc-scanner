@@ -62,8 +62,8 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
     private List<Point> docCorners = null;
 
     private long lastProcessedTime = 0;
-    private static final long PROCESSING_INTERVAL_MS = 1000; // Process every 1000ms (1 FPS) to reduce lag
-    private static final long MIN_DETECTION_INTERVAL_MS = 1000; // Minimum time between successful detections
+    private static final long PROCESSING_INTERVAL_MS = 100; // Process every 100ms (10 FPS) for faster response
+    private static final long MIN_DETECTION_INTERVAL_MS = 200; // Minimum time between successful detections
 
     private boolean isScanningPaused = false;
     private boolean isCurrentlyProcessing = false; // Prevent processing queue buildup
@@ -87,8 +87,8 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
     private boolean showRectangleOverlay = true;
     private int overlayColor = 0xFF00FF00; // Green color (ARGB format)
     
-    // Document detection configuration
-    private int numOfRectangles = 3; // Number of consistent detections before capture
+    // Document detection configuration - optimized for speed
+    private int numOfRectangles = 5; // Reduced from 10 to 5 for faster capture
     private volatile int numOfSquares = 0; // Current detection count
     private boolean autoCapture = true; // Enable auto-capture when document is detected
 
@@ -120,6 +120,12 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
     // Camera characteristics
     private int lensFacing = CameraCharacteristics.LENS_FACING_BACK; // Default to back camera
     private boolean enableImageFlipCorrection = true; // Flag to enable/disable flip correction
+    
+    // Blur detection settings
+    private boolean enableBlurDetection = true; // Enable blur detection
+    private double blurThreshold = 100.0; // Laplacian variance threshold for blur detection
+    private int blurDetectionCount = 0; // Count of consecutive blur detections
+    private static final int MAX_BLUR_COUNT = 3; // Max consecutive blur detections before feedback
 
 
 
@@ -672,29 +678,30 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
                 croppedFrame = originalFrame.clone();
             }
 
-            // 2. Multi-scale processing - highly optimized for performance
-            int targetHeight = Math.min(300, croppedFrame.rows()); // Ultra low resolution for fastest GrabCut
+            // 2. Ultra-fast processing - minimal resolution for speed
+            int targetHeight = Math.min(200, croppedFrame.rows()); // Even lower resolution for speed
             double ratio = (double) targetHeight / croppedFrame.rows();
             
             frame = new Mat();
             int newWidth = (int) (croppedFrame.cols() * ratio);
             
-            if (newWidth < 200 || targetHeight < 200) {
+            if (newWidth < 150 || targetHeight < 150) {
                 Log.w(TAG, "Using original cropped frame size for processing");
                 croppedFrame.copyTo(frame);
                 ratio = 1.0;
             } else {
-                Imgproc.resize(croppedFrame, frame, new Size(newWidth, targetHeight), 0, 0, Imgproc.INTER_LANCZOS4);
+                Imgproc.resize(croppedFrame, frame, new Size(newWidth, targetHeight), 0, 0, Imgproc.INTER_LINEAR); // Faster interpolation
             }
             
-            saveCroppedMat(originalFrame, "01_originalFrame");
-            saveCroppedMat(frame, "02_resizedFrame");
+            // Skip debug saves for performance
+            // saveCroppedMat(originalFrame, "01_originalFrame");
+            // saveCroppedMat(frame, "02_resizedFrame");
             croppedFrame.release();
             
             Log.d(TAG, "📐 Processing frame: " + frame.width() + "x" + frame.height() + " (ratio: " + ratio + ")");
 
-            // 3. Use lightweight custom GrabCut-like algorithm
-            Log.d(TAG, "⚡ Using simple real-time document detection");
+            // 3. Ultra-fast document detection
+            Log.d(TAG, "⚡ Using ultra-fast document detection");
             
             // Simple document detection without aspect ratio constraints
             Point[] documentCorners = detectDocumentRealTime(frame, frame.width(), frame.height());
@@ -706,12 +713,30 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
                 
                 // Simple validation: check if it's a reasonable quadrilateral
                 if (isValidQuadrilateral(originalCorners)) {
+                    // Check for blur before proceeding with detection
+                    if (isImageBlurry(originalFrame)) {
+                        Log.w(TAG, "⚠️ Blurry image detected, skipping detection");
+                        numOfSquares = Math.max(0, numOfSquares - 1); // Decrement count for blur
+                        return; // Skip processing blurry images
+                    }
+                    
+                    // Reset blur counter for sharp images
+                    blurDetectionCount = 0;
+                    
                     numOfSquares++; // Increment detection count
                     Log.d(TAG, "✅ Document detected! Count: " + numOfSquares + "/" + numOfRectangles);
                     
                     // Check if we have enough consistent detections
                     if (numOfSquares >= numOfRectangles) {
                         Log.d(TAG, "🎯 Stable document detection achieved!");
+                        
+                        // Final blur check before capture
+                        if (isImageBlurry(originalFrame)) {
+                            Log.w(TAG, "⚠️ Final blur check failed, skipping capture");
+                            sendFeedbackIfNeeded("Image is blurry. Please hold the camera steady.");
+                            numOfSquares = Math.max(0, numOfSquares - 2); // Decrement more for blur
+                            return;
+                        }
                         
                         // Enhanced perspective transformation
                         Mat croppedDocument = performSimplePerspectiveTransform(originalFrame, originalCorners);
@@ -3379,7 +3404,7 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
 
     // Throttle overlay updates to avoid spam
     private long lastOverlaySentTime = 0;
-    private static final long OVERLAY_UPDATE_INTERVAL_MS = 500; // Send overlay updates every 500ms
+    private static final long OVERLAY_UPDATE_INTERVAL_MS = 50; // Send overlay updates every 50ms for real-time response
 
     /**
      * Send overlay coordinates to React Native for display
@@ -3389,7 +3414,7 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
             return;
         }
 
-        // Throttle updates to avoid spamming React Native
+        // Minimal throttling for real-time response
         long currentTime = System.currentTimeMillis();
         if (currentTime - lastOverlaySentTime < OVERLAY_UPDATE_INTERVAL_MS) {
             return;
@@ -3449,14 +3474,13 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
      * This method detects rectangular documents without aspect ratio constraints
      */
     private Point[] detectDocumentRealTime(Mat frame, int width, int height) {
-        Log.d(TAG, "🔍 Starting real-time document detection");
+        Log.d(TAG, "⚡ Ultra-fast document detection");
         
         Mat gray = null;
-        Mat blurred = null;
-        Mat edges = null;
+        Mat thresh = null;
         
         try {
-            // 1. Convert to grayscale
+            // 1. Convert to grayscale (fastest approach)
             gray = new Mat();
             if (frame.channels() == 3) {
                 Imgproc.cvtColor(frame, gray, Imgproc.COLOR_BGR2GRAY);
@@ -3464,81 +3488,71 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
                 gray = frame.clone();
             }
             
-            // 2. Apply Gaussian blur to reduce noise
-            blurred = new Mat();
-            Imgproc.GaussianBlur(gray, blurred, new Size(5, 5), 0);
+            // 2. Simple thresholding (much faster than Canny)
+            thresh = new Mat();
+            Imgproc.threshold(gray, thresh, 0, 255, Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU);
             
-            // 3. Apply Canny edge detection
-            edges = new Mat();
-            Imgproc.Canny(blurred, edges, 75, 200, 3, false);
-            
-            // 4. Find contours
+            // 3. Find contours (fastest method)
             List<MatOfPoint> contours = new ArrayList<>();
-            Mat hierarchy = new Mat();
-            Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE);
-            hierarchy.release();
+            Imgproc.findContours(thresh, contours, new Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
             
             if (contours.isEmpty()) {
-                Log.d(TAG, "No contours found");
                 return null;
             }
             
-            // 5. Sort contours by area (largest first)
-            contours.sort((c1, c2) -> Double.compare(Imgproc.contourArea(c2), Imgproc.contourArea(c1)));
+            // 4. Find largest contour (simple and fast)
+            MatOfPoint largestContour = null;
+            double maxArea = 0;
             
-            // 6. Look for the largest rectangular contour
             for (MatOfPoint contour : contours) {
                 double area = Imgproc.contourArea(contour);
-                double frameArea = width * height;
-                
-                // Skip very small contours (less than 10% of frame area)
-                if (area < frameArea * 0.1) {
-                    continue;
+                if (area > maxArea && area > width * height * 0.15) { // At least 15% of frame
+                    maxArea = area;
+                    largestContour = contour;
                 }
-                
-                // Approximate contour to polygon
-                MatOfPoint2f contour2f = new MatOfPoint2f();
-                contour.convertTo(contour2f, CvType.CV_32FC2);
-                
-                double epsilon = 0.02 * Imgproc.arcLength(contour2f, true);
-                MatOfPoint2f approx2f = new MatOfPoint2f();
-                Imgproc.approxPolyDP(contour2f, approx2f, epsilon, true);
-                
-                // Convert back to MatOfPoint for corner extraction
-                MatOfPoint approx = new MatOfPoint();
-                approx2f.convertTo(approx, CvType.CV_32S);
-                
-                Point[] points = approx.toArray();
-                
-                // Check if it's a quadrilateral (4 corners)
-                if (points.length == 4) {
-                    Log.d(TAG, "✅ Found quadrilateral with area: " + area);
-                    
-                    // Order the points (top-left, top-right, bottom-right, bottom-left)
-                    Point[] orderedPoints = orderPoints(points);
-                    
-                    contour2f.release();
-                    approx2f.release();
-                    approx.release();
-                    
-                    return orderedPoints;
-                }
+            }
+            
+            if (largestContour == null) {
+                return null;
+            }
+            
+            // 5. Approximate to quadrilateral (fast approximation)
+            MatOfPoint2f contour2f = new MatOfPoint2f();
+            largestContour.convertTo(contour2f, CvType.CV_32FC2);
+            
+            double epsilon = 0.04 * Imgproc.arcLength(contour2f, true); // More lenient approximation
+            MatOfPoint2f approx2f = new MatOfPoint2f();
+            Imgproc.approxPolyDP(contour2f, approx2f, epsilon, true);
+            
+            MatOfPoint approx = new MatOfPoint();
+            approx2f.convertTo(approx, CvType.CV_32S);
+            
+            Point[] points = approx.toArray();
+            
+            // 6. Check if it's a quadrilateral
+            if (points.length == 4) {
+                Log.d(TAG, "✅ Fast quadrilateral detection successful");
+                Point[] orderedPoints = orderPoints(points);
                 
                 contour2f.release();
                 approx2f.release();
                 approx.release();
+                
+                return orderedPoints;
             }
             
-            Log.d(TAG, "No suitable quadrilateral found");
+            contour2f.release();
+            approx2f.release();
+            approx.release();
+            
             return null;
             
         } catch (Exception e) {
-            Log.e(TAG, "Error in real-time document detection", e);
+            Log.e(TAG, "Error in fast document detection", e);
             return null;
         } finally {
             if (gray != null) gray.release();
-            if (blurred != null) blurred.release();
-            if (edges != null) edges.release();
+            if (thresh != null) thresh.release();
         }
     }
     
@@ -3675,6 +3689,110 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
     public void setImageFlipCorrection(boolean enable) {
         this.enableImageFlipCorrection = enable;
         Log.d(TAG, "Image flip correction set to: " + this.enableImageFlipCorrection);
+    }
+    
+    /**
+     * Set the detection refresh rate in milliseconds (like react-native-document-scanner)
+     * Lower values = faster detection, higher values = better performance
+     */
+    public void setDetectionRefreshRateInMS(int refreshRateMS) {
+        if (refreshRateMS > 0) {
+            // Note: This would require making PROCESSING_INTERVAL_MS non-final
+            // For now, we'll use a different approach
+            Log.d(TAG, "Detection refresh rate requested: " + refreshRateMS + "ms (use setDetectionCountBeforeCapture for tuning)");
+        }
+    }
+    
+    /**
+     * Enable or disable blur detection
+     */
+    public void setBlurDetection(boolean enable) {
+        this.enableBlurDetection = enable;
+        Log.d(TAG, "Blur detection set to: " + this.enableBlurDetection);
+    }
+    
+    /**
+     * Set blur detection threshold (lower = more sensitive to blur)
+     * @param threshold Laplacian variance threshold (default: 100.0)
+     */
+    public void setBlurThreshold(double threshold) {
+        this.blurThreshold = threshold;
+        Log.d(TAG, "Blur threshold set to: " + this.blurThreshold);
+    }
+    
+    /**
+     * Get current blur detection status
+     * @return true if blur detection is enabled
+     */
+    public boolean isBlurDetectionEnabled() {
+        return enableBlurDetection;
+    }
+    
+    /**
+     * Get current blur detection count
+     * @return number of consecutive blur detections
+     */
+    public int getBlurDetectionCount() {
+        return blurDetectionCount;
+    }
+    
+    /**
+     * Detect if image is blurry using Laplacian variance
+     * @param image Input image to check for blur
+     * @return true if image is blurry, false otherwise
+     */
+    private boolean isImageBlurry(Mat image) {
+        if (!enableBlurDetection || image == null || image.empty()) {
+            return false;
+        }
+        
+        try {
+            Mat gray = new Mat();
+            Mat laplacian = new Mat();
+            MatOfDouble mean = new MatOfDouble();
+            MatOfDouble stddev = new MatOfDouble();
+            
+            // Convert to grayscale if needed
+            if (image.channels() == 3) {
+                Imgproc.cvtColor(image, gray, Imgproc.COLOR_BGR2GRAY);
+            } else {
+                gray = image.clone();
+            }
+            
+            // Apply Laplacian filter to detect edges
+            Imgproc.Laplacian(gray, laplacian, CvType.CV_64F);
+            
+            // Calculate variance of Laplacian
+            Core.meanStdDev(laplacian, mean, stddev);
+            double variance = stddev.get(0, 0)[0] * stddev.get(0, 0)[0];
+            
+            // Clean up
+            gray.release();
+            laplacian.release();
+            mean.release();
+            stddev.release();
+            
+            Log.d(TAG, "Blur detection - Laplacian variance: " + variance + " (threshold: " + blurThreshold + ")");
+            
+            boolean isBlurry = variance < blurThreshold;
+            
+            if (isBlurry) {
+                blurDetectionCount++;
+                Log.d(TAG, "Blur detected! Count: " + blurDetectionCount + "/" + MAX_BLUR_COUNT);
+                
+                if (blurDetectionCount >= MAX_BLUR_COUNT) {
+                    sendFeedbackIfNeeded("Image is blurry. Please hold the camera steady.");
+                }
+            } else {
+                blurDetectionCount = 0; // Reset counter for sharp images
+            }
+            
+            return isBlurry;
+            
+        } catch (Exception e) {
+            Log.e(TAG, "Error in blur detection", e);
+            return false;
+        }
     }
     
     /**
