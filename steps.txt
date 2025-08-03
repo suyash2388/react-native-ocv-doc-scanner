@@ -1,0 +1,72 @@
+adb logcat -s CameraPreview:D | cat
+
+hasDocumentLikeShapeInRegion(Mat frame)
+├── Imgproc.cvtColor(frame, gray, COLOR_RGB2GRAY)
+├── Imgproc.Canny(gray, edges, 30, 100)  // Edge detection
+├── Core.countNonZero(edges) → edge density calculation
+├── Imgproc.findContours(edges, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE)
+├── For each contour:
+│   ├── Imgproc.contourArea(contour) → area validation
+│   ├── Imgproc.arcLength(contour2f, true) → perimeter calculation
+│   ├── Imgproc.approxPolyDP(contour2f, approx, epsilon, true) → polygon approximation
+│   └── isRoughlyRectangular() → shape validation
+└── Return: document-like shape detected (boolean)
+
+
+detectCornersWithLineIntersection(Mat frame)
+├── Imgproc.cvtColor(frame, gray, COLOR_RGB2GRAY)
+├── Imgproc.Canny(gray, edges, 40, 120)
+├── Imgproc.findContours(edges, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE)
+├── Find best contour:
+│   ├── Imgproc.contourArea(contour) → area filtering
+│   ├── Imgproc.boundingRect(contour) → bounding box
+│   └── Aspect ratio validation
+└── Create rectangular corners from bounding box
+
+detectRectangularCorners(Mat frame)
+├── Imgproc.cvtColor(frame, gray, COLOR_RGB2GRAY)
+├── Imgproc.GaussianBlur(gray, blurred, Size(5,5), 0)
+├── Imgproc.Canny(blurred, edges, 50, 150)
+├── Imgproc.getStructuringElement(MORPH_RECT, Size(3,3)) → morphological kernel
+├── Imgproc.morphologyEx(edges, edges, MORPH_CLOSE, kernel)
+├── Imgproc.findContours(edges, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE)
+├── For each contour:
+│   ├── Imgproc.contourArea(contour) → area validation
+│   ├── Imgproc.arcLength(contour2f, true) → perimeter calculation
+│   ├── Imgproc.approxPolyDP(contour2f, approx, epsilon, true) → strict approximation
+│   └── Check for exactly 4 corners
+└── Return 4-corner rectangle or null
+
+detectCornersWithBoundingBox(Mat frame)
+├── Imgproc.cvtColor(frame, gray, COLOR_RGB2GRAY)
+├── Imgproc.GaussianBlur(gray, blurred, Size(7,7), 0)
+├── Imgproc.Canny(blurred, edges, 30, 100)
+├── Imgproc.getStructuringElement(MORPH_ELLIPSE, Size(3,3)) → elliptical kernel
+├── Imgproc.morphologyEx(edges, edges, MORPH_CLOSE, kernel)
+├── Imgproc.findContours(edges, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE)
+├── Find best contour with scoring:
+│   ├── Imgproc.contourArea(contour) → area calculation
+│   ├── Imgproc.boundingRect(contour) → bounding rectangle
+│   ├── Fill ratio calculation (area/boundingArea)
+│   └── Score = area × fillRatio
+└── Create tight rectangular corners with minimal padding
+
+isDocumentRegionBlurry(Mat frame, corners)
+├── Create ROI from document corners
+├── Imgproc.boundingRect(corners) → get bounding rectangle
+├── new Mat(frame, boundingRect) → extract document region
+├── Imgproc.cvtColor(documentROI, gray, COLOR_RGB2GRAY)
+├── Imgproc.Laplacian(gray, laplacian, CV_64F) → edge sharpness detection
+├── Core.meanStdDev(laplacian, mean, stddev) → statistical analysis
+├── variance = stddev² → focus measure calculation
+└── Return: variance < 50 (blurry threshold)
+
+hasGlareInDocumentRegion(Mat frame, corners)
+├── Create ROI from document corners
+├── Imgproc.boundingRect(corners) → get bounding rectangle  
+├── new Mat(frame, boundingRect) → extract document region
+├── Imgproc.cvtColor(documentROI, gray, COLOR_RGB2GRAY)
+├── Imgproc.threshold(gray, bright, 200, 255, THRESH_BINARY) → bright region detection
+├── Core.countNonZero(bright) → count overexposed pixels
+├── glareRatio = brightPixels / totalPixels
+└── Return: glareRatio > 0.20 (glare threshold)

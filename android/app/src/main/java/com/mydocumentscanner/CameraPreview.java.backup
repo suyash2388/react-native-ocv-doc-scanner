@@ -1,0 +1,1295 @@
+// CameraPreview.java
+
+package com.mydocumentscanner;
+
+import android.Manifest;
+import android.content.Context;
+import android.content.pm.PackageManager;
+import android.graphics.ImageFormat;
+import android.graphics.SurfaceTexture;
+import android.hardware.camera2.*;
+import android.media.Image;
+import android.media.ImageReader;
+import android.os.Build;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.util.AttributeSet;
+import android.util.Base64;
+import android.util.Log;
+import android.view.Surface;
+import android.view.TextureView;
+import android.view.WindowManager;
+import android.os.Environment;
+import java.io.File;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+
+import org.opencv.core.*;
+import org.opencv.imgcodecs.Imgcodecs;
+import org.opencv.imgproc.CLAHE;
+import org.opencv.imgproc.Imgproc;
+import org.opencv.utils.Converters;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Locale;
+
+import com.facebook.react.bridge.Arguments;
+import com.facebook.react.bridge.Promise;
+import com.facebook.react.bridge.ReactApplicationContext;
+import com.facebook.react.bridge.WritableMap;
+
+public class CameraPreview extends TextureView implements TextureView.SurfaceTextureListener {
+
+    private static final String TAG = "CameraPreview";
+    private Context context;
+    private CameraDevice cameraDevice;
+    private CameraCaptureSession captureSession;
+    private Handler backgroundHandler;
+    private HandlerThread backgroundThread;
+    private ImageReader imageReader;
+    private int sensorOrientation;
+
+    private int imageWidth = 1920; // or the highest supported width
+    private int imageHeight = 1080; // or the corresponding height
+    private int lastProcessedRotation = -1; // Track last rotation to avoid dimension swapping every frame
+
+    private List<Point> docCorners = null;
+
+    private long lastProcessedTime = 0;
+    private static final long PROCESSING_INTERVAL_MS = 1000; // Process every 1000ms (1 FPS) to reduce lag
+    private static final long MIN_DETECTION_INTERVAL_MS = 1000; // Minimum time between successful detections
+
+    private boolean isScanningPaused = false;
+    private boolean isCurrentlyProcessing = false; // Prevent processing queue buildup
+
+    // Auto-resume scanning after successful capture
+    // private static final long AUTO_RESUME_DELAY_MS = 3000; // 3 seconds
+    // private Runnable autoResumeRunnable = null;
+
+    // Scan region variables (in screen coordinates)
+    private double scanRegionX = 0;
+    private double scanRegionY = 0;
+    private double scanRegionWidth = 0;
+    private double scanRegionHeight = 0;
+    private boolean hasScanRegion = false;
+
+    // Expected document aspect ratio for validation
+    private double expectedAspectRatio = 0.0;
+    private String documentType = "Unknown";
+
+    // Rectangle overlay settings
+    private boolean showRectangleOverlay = true;
+    private int overlayColor = 0xFF00FF00; // Green color (ARGB format)
+
+    // // Mat object pool to reduce allocation overhead
+    // private Mat pooledFrame = null;
+    // private Mat pooledGray = null;
+    // private Mat pooledResized = null;
+
+    // Pipeline state tracking
+    // private boolean lastFrameHadDocument = false;
+    // private long lastDocumentTime = 0;
+    // private static final long DOCUMENT_CONFIDENCE_WINDOW_MS = 1000; // 1 second confidence window
+
+    // Feedback tolerance tracking
+    // private int consecutiveDetectionFailures = 0;
+    // private static final int DETECTION_FAILURE_THRESHOLD = 3; // Show positioning message after 3 consecutive failures
+
+    // // Pipeline failure tracking for specific feedback
+    // private boolean blurDetected = false;
+    // private boolean glareDetected = false;
+
+    // Feedback message tracking to prevent repeated messages
+    private String lastFeedbackMessage = "";
+    private long lastFeedbackTime = 0;
+
+    // Overlay view for scan region visualization
+    private OverlayView overlayView;
+
+
+
+    public interface FrameListener {
+        void onDocumentDetected(@Nullable List<Point> corners, int frameWidth, int frameHeight,
+                @Nullable String croppedImageBase64);
+
+        void onImageCaptured(String imagePath);
+
+        void onFeedback(String feedbackMessage);
+
+        void onOverlayUpdate(double x, double y, double width, double height);
+    }
+
+    private FrameListener frameListener;
+
+    public void setFrameListener(FrameListener listener) {
+        this.frameListener = listener;
+    }
+
+    public CameraPreview(Context context) {
+        super(context);
+        init(context);
+    }
+
+    public CameraPreview(Context context, AttributeSet attrs) {
+        super(context, attrs);
+        init(context);
+    }
+
+    public CameraPreview(Context context, AttributeSet attrs, int defStyleAttr) {
+        super(context, attrs, defStyleAttr);
+        init(context);
+    }
+
+    private void init(Context ctx) {
+        context = ctx;
+        setSurfaceTextureListener(this);
+        // Initialize template matching module
+        try {
+            ReactApplicationContext reactContext = new ReactApplicationContext(ctx);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to initialize template matching module: " + e.getMessage());
+        }
+    }
+
+    public void pauseScanning() {
+        isScanningPaused = true;
+    }
+
+    public void resumeScanning() {
+        isScanningPaused = false;
+    }
+
+    public void setExpectedDocumentRatio(double aspectRatio, String docType) {
+        this.expectedAspectRatio = aspectRatio;
+        this.documentType = docType;
+        
+        // Calculate optimal scan region based on aspect ratio
+        calculateOptimalScanRegion(aspectRatio);
+        
+        Log.d(TAG, "Expected document ratio set: " + aspectRatio + " for " + docType);
+    }
+    private void calculateOptimalScanRegion(double aspectRatio) {
+        // Get the actual frame dimensions after rotation
+        int rotation = getImageRotation();
+        double frameWidth, frameHeight;
+        
+        // Account for rotation when determining frame dimensions
+        if (rotation == 90 || rotation == 270) {
+            // Portrait mode - swap dimensions
+            frameWidth = imageHeight;
+            frameHeight = imageWidth;
+        } else {
+            // Landscape mode - keep original dimensions
+            frameWidth = imageWidth;
+            frameHeight = imageHeight;
+        }
+
+        // Set scan region width to 90% of frame width
+        double regionWidth = frameWidth * 0.9;
+        double regionHeight = regionWidth / aspectRatio;
+
+        // Do NOT limit regionHeight to frameHeight; allow overflow if aspect ratio is tall
+        scanRegionWidth = regionWidth;
+        scanRegionHeight = regionHeight;
+        scanRegionX = (frameWidth - scanRegionWidth) / 2.0;
+        scanRegionY = (frameHeight - scanRegionHeight) / 2.0;
+
+        hasScanRegion = true;
+        Log.d(TAG, String.format("Scan region set (rotation=%d°): x=%.1f, y=%.1f, w=%.1f, h=%.1f (aspectRatio=%.3f)", 
+               rotation, scanRegionX, scanRegionY, scanRegionWidth, scanRegionHeight, aspectRatio));
+        // Update overlay coordinates immediately
+        updateOverlayCoordinates();
+    }
+    /**
+     * Update overlay coordinates for external overlay view
+     */
+    private void updateOverlayCoordinates() {
+        if (overlayView != null && hasScanRegion && expectedAspectRatio > 0) {
+            // Get view dimensions
+            int viewWidth = getWidth();
+            int viewHeight = getHeight();
+    
+            if (viewWidth > 0 && viewHeight > 0) {
+                // Calculate rectangle in view coordinates
+                double boxWidth = viewWidth * 0.9;
+                double boxHeight = boxWidth / expectedAspectRatio;
+    
+                // If boxHeight is too tall, fit to height instead
+                if (boxHeight > viewHeight * 0.9) {
+                    boxHeight = viewHeight * 0.9;
+                    boxWidth = boxHeight * expectedAspectRatio;
+                }
+    
+                double left = (viewWidth - boxWidth) / 2.0;
+                double top = (viewHeight - boxHeight) / 2.0;
+    
+                Log.d(TAG, String.format("Overlay in view: left=%.1f, top=%.1f, width=%.1f, height=%.1f, aspect=%.3f", left, top, boxWidth, boxHeight, expectedAspectRatio));
+    
+                overlayView.updateScanRegion(left, top, boxWidth, boxHeight);
+            }
+        }
+    }
+
+    public void setOverlayView(OverlayView overlay) {
+        this.overlayView = overlay;
+    }
+    /**
+     * Send feedback only if message is different or enough time has passed
+     * This prevents instruction text from persisting too long
+     */
+    private void sendFeedbackIfNeeded(String message) {
+        long currentTime = System.currentTimeMillis();
+        boolean isDifferentMessage = !message.equals(lastFeedbackMessage);
+        boolean timeElapsed = (currentTime - lastFeedbackTime) > 2000; // 2 seconds
+
+        if (isDifferentMessage || timeElapsed) {
+            if (frameListener != null) {
+                frameListener.onFeedback(message);
+                lastFeedbackMessage = message;
+                lastFeedbackTime = currentTime;
+                Log.d(TAG, "Feedback sent: " + message);
+            }
+        }
+    }
+
+    public void openCamera() {
+        Log.d(TAG, "Opening camera - Starting initialization");
+        startBackgroundThread();
+        CameraManager manager = (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
+
+        try {
+            String cameraId = manager.getCameraIdList()[0];
+            CameraCharacteristics characteristics = manager.getCameraCharacteristics(cameraId);
+            sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                if (context.checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                    // Permission is not granted
+                    return;
+                }
+            }
+
+            manager.openCamera(cameraId, stateCallback, backgroundHandler);
+        } catch (CameraAccessException e) {
+            Log.e(TAG, "CameraAccessException", e);
+        }
+    }
+
+    private int getDeviceRotation() {
+        WindowManager windowManager = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
+        int rotation = windowManager.getDefaultDisplay().getRotation();
+        return rotation;
+    }
+
+    private int getImageRotation() {
+        int deviceRotation = deviceRotationDegrees(getDeviceRotation());
+        int rotationCompensation = (sensorOrientation + deviceRotation + 360) % 360;
+        return rotationCompensation;
+    }
+
+    private int deviceRotationDegrees(int deviceRotation) {
+        switch (deviceRotation) {
+            case Surface.ROTATION_0:
+                return 0;
+            case Surface.ROTATION_90:
+                return 270;
+            case Surface.ROTATION_180:
+                return 180;
+            case Surface.ROTATION_270:
+                return 90;
+            default:
+                return 0;
+        }
+    }
+
+    public void closeCamera() {
+        // Cancel any pending auto-resume
+        // if (autoResumeRunnable != null && backgroundHandler != null) {
+        //     backgroundHandler.removeCallbacks(autoResumeRunnable);
+        //     autoResumeRunnable = null;
+        // }
+
+        if (captureSession != null) {
+            captureSession.close();
+            captureSession = null;
+        }
+
+        if (cameraDevice != null) {
+            cameraDevice.close();
+            cameraDevice = null;
+        }
+
+        if (imageReader != null) {
+            imageReader.close();
+            imageReader = null;
+        }
+
+        // Clean up pooled Mat objects
+        // if (pooledFrame != null) {
+        //     pooledFrame.release();
+        //     pooledFrame = null;
+        // }
+        // if (pooledGray != null) {
+        //     pooledGray.release();
+        //     pooledGray = null;
+        // }
+        // if (pooledResized != null) {
+        //     pooledResized.release();
+        //     pooledResized = null;
+        // }
+
+        stopBackgroundThread();
+    }
+
+    private void startBackgroundThread() {
+        backgroundThread = new HandlerThread("CameraBackground");
+        backgroundThread.start();
+        backgroundHandler = new Handler(backgroundThread.getLooper());
+    }
+
+    private void stopBackgroundThread() {
+        if (backgroundThread != null) {
+            backgroundThread.quitSafely();
+            try {
+                backgroundThread.join();
+                backgroundThread = null;
+                backgroundHandler = null;
+            } catch (InterruptedException e) {
+                Log.e(TAG, "Error stopping background thread", e);
+            }
+        }
+    }
+
+    private final CameraDevice.StateCallback stateCallback = new CameraDevice.StateCallback() {
+
+        @Override
+        public void onOpened(@NonNull CameraDevice camera) {
+            Log.d(TAG, "Camera opened successfully - Creating preview session");
+            cameraDevice = camera;
+            createCameraPreviewSession();
+        }
+
+        @Override
+        public void onDisconnected(@NonNull CameraDevice camera) {
+            Log.d(TAG, "Camera disconnected");
+            closeCamera();
+        }
+
+        @Override
+        public void onError(@NonNull CameraDevice camera, int error) {
+            Log.e(TAG, "Camera error: " + error);
+            closeCamera();
+        }
+    };
+
+    private void createCameraPreviewSession() {
+        try {
+            SurfaceTexture texture = getSurfaceTexture();
+            assert texture != null;
+
+            texture.setDefaultBufferSize(imageWidth, imageHeight);
+            Surface surface = new Surface(texture);
+
+            // Set up ImageReader to receive camera frames - use smaller buffer for better
+            // performance
+            imageReader = ImageReader.newInstance(imageWidth, imageHeight, ImageFormat.YUV_420_888, 1);
+            imageReader.setOnImageAvailableListener(onImageAvailableListener, backgroundHandler);
+
+            final CaptureRequest.Builder previewRequestBuilder = cameraDevice
+                    .createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            previewRequestBuilder.addTarget(surface);
+            previewRequestBuilder.addTarget(imageReader.getSurface());
+
+            cameraDevice.createCaptureSession(Arrays.asList(surface, imageReader.getSurface()),
+                    new CameraCaptureSession.StateCallback() {
+
+                        @Override
+                        public void onConfigured(@NonNull CameraCaptureSession session) {
+                            if (cameraDevice == null)
+                                return;
+
+                            Log.d(TAG, "Camera capture session configured - Starting preview");
+                            captureSession = session;
+                            try {
+                                previewRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE,
+                                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+                                CaptureRequest previewRequest = previewRequestBuilder.build();
+                                captureSession.setRepeatingRequest(previewRequest, null, backgroundHandler);
+                            } catch (CameraAccessException e) {
+                                Log.e(TAG, "CameraAccessException in createCameraPreviewSession", e);
+                            }
+                        }
+
+                        @Override
+                        public void onConfigureFailed(@NonNull CameraCaptureSession session) {
+                            Log.e(TAG, "Failed to configure camera preview session");
+                        }
+                    }, backgroundHandler);
+        } catch (CameraAccessException e) {
+            Log.e(TAG, "CameraAccessException in createCameraPreviewSession", e);
+        }
+    }
+
+    private final ImageReader.OnImageAvailableListener onImageAvailableListener = reader -> {
+        long currentTime = System.currentTimeMillis();
+
+        // Skip if we're currently processing or if we're within the interval
+        if (isCurrentlyProcessing || currentTime - lastProcessedTime < PROCESSING_INTERVAL_MS) {
+            // Always clear the queue to prevent buildup - get latest frame and discard
+            Image image = reader.acquireLatestImage();
+            if (image != null) {
+                image.close();
+            }
+            return;
+        } else {
+            Log.d(TAG, "Proceeding to process frame: processing=" + isCurrentlyProcessing + ", interval="
+                    + (currentTime - lastProcessedTime) + "ms");
+        }
+
+        lastProcessedTime = currentTime;
+        isCurrentlyProcessing = true;
+
+        Image image = null;
+        try {
+            // Get the latest available image (ImageReader maxImages=1, so only one at a
+            // time)
+            image = reader.acquireLatestImage();
+
+            // Process the frame if we got one
+            if (image != null) {
+                Log.d(TAG, "Processing image: " + image.getWidth() + "x" + image.getHeight());
+                processImage(image);
+            } else {
+                Log.d(TAG, "No image available to process");
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error processing image", e);
+        } finally {
+            if (image != null) {
+                image.close();
+                Log.d(TAG, "Image closed successfully");
+            }
+            isCurrentlyProcessing = false;
+        }
+    };
+
+    private int getOpenCvRotationCode(int rotationDegrees) {
+        switch (rotationDegrees) {
+            case 90:
+                return Core.ROTATE_90_CLOCKWISE;
+            case 180:
+                return Core.ROTATE_180;
+            case 270:
+                return Core.ROTATE_90_COUNTERCLOCKWISE;
+            default:
+                return -1; // No rotation
+        }
+    }
+
+    private void processImage(Image image) {
+        if (isScanningPaused) {
+            Log.d(TAG, "Scanning is paused, skipping frame");
+            return;
+        }
+
+        // Check if rotation has changed and recalculate scan region if needed
+        int currentRotation = getImageRotation();
+        if (currentRotation != lastProcessedRotation && expectedAspectRatio > 0) {
+            Log.d(TAG, "Rotation changed from " + lastProcessedRotation + "° to " + currentRotation + "°, recalculating scan region");
+            calculateOptimalScanRegion(expectedAspectRatio);
+            lastProcessedRotation = currentRotation;
+        }
+
+        // Update overlay coordinates on every frame
+        updateOverlayCoordinates();
+
+        // Convert image to Mat for processing only when we're going to use it
+        Mat frame = imageToMat(image);
+        
+        if (frame == null || frame.empty()) {
+            Log.e(TAG, "Failed to convert image to Mat");
+            return;
+        }
+
+        // Apply rotation to match display orientation
+        Mat rotatedFrame = applyDisplayRotation(frame);
+        frame.release();
+
+        Log.d(TAG, "Starting async document detection for frame: " + rotatedFrame.width() + "x" + rotatedFrame.height());
+
+        // Process document detection asynchronously
+        processDocumentDetectionAsync(rotatedFrame);
+    }
+
+    /**
+     * Apply rotation to match the display orientation
+     */
+    private Mat applyDisplayRotation(Mat frame) {
+        int rotation = getImageRotation();
+        int rotationCode = getOpenCvRotationCode(rotation);
+        
+        if (rotationCode == -1) {
+            Log.d(TAG, "No rotation needed, rotation: " + rotation);
+            return frame;
+        }
+        
+        Mat rotated = new Mat();
+        Core.rotate(frame, rotated, rotationCode);
+        Log.d(TAG, "Applied rotation: " + rotation + "° (code: " + rotationCode + "), frame: " + 
+              frame.width() + "x" + frame.height() + " -> " + rotated.width() + "x" + rotated.height());
+        
+        return rotated;
+    }
+
+    /**
+     * Process document detection asynchronously to avoid blocking camera thread
+     */
+    private void processDocumentDetectionAsync(Mat frame) {
+        if (backgroundHandler != null) {
+            backgroundHandler.post(() -> {
+                try {
+                    detectDocumentWithGrabCut(frame);
+                } catch (Exception e) {
+                    Log.e(TAG, "Error in document detection", e);
+                } finally {
+                    frame.release();
+                }
+            });
+        } else {
+            frame.release();
+        }
+    }
+
+    /**
+     * Optimized document detection without GrabCut for better performance
+     */
+    private void detectDocumentWithGrabCut(Mat originalFrame) {
+        Log.d(TAG, "🔍 Starting optimized document detection");
+        
+        if (originalFrame == null || originalFrame.empty()) {
+            Log.e(TAG, "❌ Original frame is null or empty");
+            return;
+        }
+
+        Log.d(TAG, "📏 Original frame size: " + originalFrame.width() + "x" + originalFrame.height());
+
+        Mat frame = null;
+        Mat gray = null;
+        Mat blurred = null;
+        Mat edges = null;
+        Mat kernel = null;
+        
+        try {
+            // 1. Crop to scan region if available for more focused detection
+            Mat croppedFrame = null;
+            double cropRatio = 1.0;
+            
+            if (hasScanRegion && scanRegionWidth > 50 && scanRegionHeight > 50) {
+                // Calculate crop region with some padding
+                int padding = 50;
+                int cropX = Math.max(0, (int)(scanRegionX - padding));
+                int cropY = Math.max(0, (int)(scanRegionY - padding));
+                int cropW = Math.min(originalFrame.width() - cropX, (int)(scanRegionWidth + 2*padding));
+                int cropH = Math.min(originalFrame.height() - cropY, (int)(scanRegionHeight + 2*padding));
+                
+                if (cropW > 100 && cropH > 100) {
+                    org.opencv.core.Rect cropRect = new org.opencv.core.Rect(cropX, cropY, cropW, cropH);
+                    croppedFrame = new Mat(originalFrame, cropRect);
+                    Log.d(TAG, "🔍 Cropped to scan region: " + cropX + "," + cropY + " " + cropW + "x" + cropH);
+                } else {
+                    Log.d(TAG, "📐 Scan region too small, using full frame");
+                    croppedFrame = originalFrame.clone();
+                }
+            } else {
+                Log.d(TAG, "📐 No scan region defined, using full frame");
+                croppedFrame = originalFrame.clone();
+            }
+
+            // 2. Resize image for faster processing
+            int targetHeight = 500;
+            if (croppedFrame.rows() <= 0) {
+                Log.e(TAG, "Invalid cropped frame dimensions");
+                if (croppedFrame != null) croppedFrame.release();
+                return;
+            }
+            
+            double ratio = (double) targetHeight / croppedFrame.rows();
+            frame = new Mat();
+            
+            // Ensure minimum frame size after resize
+            int newWidth = (int) (croppedFrame.cols() * ratio);
+            if (newWidth < 100 || targetHeight < 100) {
+                Log.w(TAG, "Resized frame would be too small, using cropped frame as-is");
+                croppedFrame.copyTo(frame);
+                ratio = 1.0;
+            } else {
+                Imgproc.resize(croppedFrame, frame, new Size(newWidth, targetHeight));
+            }
+            
+            croppedFrame.release();
+            
+            Log.d(TAG, "📐 Final processing frame: " + frame.width() + "x" + frame.height() + " (ratio: " + ratio + ")");
+
+            // 2. Convert to grayscale and apply Gaussian blur
+            gray = new Mat();
+            Imgproc.cvtColor(frame, gray, Imgproc.COLOR_BGR2GRAY);
+            
+            blurred = new Mat();
+            Imgproc.GaussianBlur(gray, blurred, new Size(5, 5), 0);
+
+            // 3. Edge detection with adaptive threshold
+            edges = new Mat();
+            Imgproc.Canny(blurred, edges, 50, 150);
+
+            
+            // 4. Apply morphological operations to connect edges
+            kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(3, 3));
+            Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, kernel);
+            Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_DILATE, kernel);
+
+            saveCroppedMat(edges);
+
+            // 5. Find contours
+            List<MatOfPoint> contours = new ArrayList<>();
+            Mat hierarchy = new Mat();
+            Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+            hierarchy.release();
+
+            Log.d(TAG, "📊 Found " + contours.size() + " contours");
+
+            if (contours.isEmpty()) {
+                Log.w(TAG, "⚠️ No contours found - sending feedback");
+                sendFeedbackIfNeeded("No document detected. Please ensure good lighting.");
+                return;
+            }
+
+            // 6. Filter contours by area and scan region, then sort by area (largest first)
+            double minContourArea = frame.total() * 0.01; // At least 1% of frame area
+            List<MatOfPoint> filteredContours = new ArrayList<>();
+            
+            for (MatOfPoint contour : contours) {
+                double area = Imgproc.contourArea(contour);
+                if (area > minContourArea) {
+                    // If we have a scan region defined, prefer contours within or overlapping it
+                    if (hasScanRegion && expectedAspectRatio > 0) {
+                        // Calculate scaled scan region for the resized frame
+                        double regionX = scanRegionX * ratio;
+                        double regionY = scanRegionY * ratio;
+                        double regionW = scanRegionWidth * ratio;
+                        double regionH = scanRegionHeight * ratio;
+                        
+                        // Check if contour overlaps with scan region
+                        org.opencv.core.Rect boundingRect = Imgproc.boundingRect(contour);
+                        org.opencv.core.Rect scanRect = new org.opencv.core.Rect(
+                            (int)regionX, (int)regionY, (int)regionW, (int)regionH);
+                        
+                        // Calculate intersection using simple rectangle overlap
+                        int x1 = Math.max(boundingRect.x, scanRect.x);
+                        int y1 = Math.max(boundingRect.y, scanRect.y);
+                        int x2 = Math.min(boundingRect.x + boundingRect.width, scanRect.x + scanRect.width);
+                        int y2 = Math.min(boundingRect.y + boundingRect.height, scanRect.y + scanRect.height);
+                        
+                        double overlapRatio = 0;
+                        if (x2 > x1 && y2 > y1) {
+                            double overlapArea = (x2 - x1) * (y2 - y1);
+                            overlapRatio = overlapArea / boundingRect.area();
+                        }
+                        
+                        // Prioritize contours with significant overlap (>30%)
+                        if (overlapRatio > 0.3) {
+                            filteredContours.add(contour);
+                            Log.d(TAG, "Added contour with " + String.format("%.1f", overlapRatio * 100) + "% overlap with scan region");
+                        }
+                    } else {
+                        // No scan region, add all large enough contours
+                        filteredContours.add(contour);
+                    }
+                }
+            }
+            
+            if (filteredContours.isEmpty()) {
+                Log.w(TAG, "⚠️ No contours large enough found");
+                sendFeedbackIfNeeded("Document too small or not visible clearly.");
+                return;
+            }
+            
+            filteredContours.sort((a, b) -> Double.compare(Imgproc.contourArea(b), Imgproc.contourArea(a)));
+            Log.d(TAG, "🔢 Processing top " + Math.min(5, filteredContours.size()) + " filtered contours");
+
+            // 7. Process top contours to find document
+            Point[] bestQuad = null;
+            boolean found = false;
+            
+            for (int i = 0; i < Math.min(5, filteredContours.size()); i++) {
+                MatOfPoint contour = filteredContours.get(i);
+                
+                if (contour == null || contour.empty()) {
+                    Log.w(TAG, "Skipping empty contour at index " + i);
+                    continue;
+                }
+                
+                Log.d(TAG, "Processing contour " + i + " with area: " + Imgproc.contourArea(contour));
+                
+                // Get convex hull
+                MatOfInt hullIndices = new MatOfInt();
+                try {
+                    Imgproc.convexHull(contour, hullIndices);
+                } catch (Exception e) {
+                    Log.w(TAG, "Failed to compute convex hull for contour " + i + ": " + e.getMessage());
+                    hullIndices.release();
+                    continue;
+                }
+                
+                Point[] contourPoints = contour.toArray();
+                int[] indices = hullIndices.toArray();
+                
+                if (indices.length == 0 || contourPoints.length == 0) {
+                    Log.w(TAG, "Empty hull or contour points at index " + i);
+                    hullIndices.release();
+                    continue;
+                }
+                
+                Point[] hullPoints = new Point[indices.length];
+                boolean validHull = true;
+                for (int j = 0; j < indices.length; j++) {
+                    if (indices[j] >= 0 && indices[j] < contourPoints.length) {
+                        hullPoints[j] = contourPoints[indices[j]];
+                    } else {
+                        Log.w(TAG, "Invalid hull index: " + indices[j] + " for contour with " + contourPoints.length + " points");
+                        validHull = false;
+                        break;
+                    }
+                }
+                
+                if (!validHull) {
+                    hullIndices.release();
+                    continue;
+                }
+                
+                MatOfPoint2f hull = new MatOfPoint2f(hullPoints);
+                
+                // Approximate polygon with more generous epsilon
+                double peri = Imgproc.arcLength(hull, true);
+                MatOfPoint2f approx = new MatOfPoint2f();
+                Imgproc.approxPolyDP(hull, approx, 0.02 * peri, true);
+                
+                Point[] approxPoints = approx.toArray();
+                Log.d(TAG, "Contour " + i + " approximated to " + approxPoints.length + " points");
+                
+                if (approxPoints.length == 4) {
+                    // Found 4-point contour, check aspect ratio
+                    if (validateAspectRatio(approxPoints, expectedAspectRatio)) {
+                        bestQuad = approxPoints;
+                        found = true;
+                        Log.d(TAG, "✅ Found valid 4-point document contour");
+                        break;
+                    } else {
+                        Log.d(TAG, "❌ 4-point contour failed aspect ratio validation");
+                    }
+                } else {
+                    // Try with more relaxed approximation
+                    MatOfPoint2f approx2 = new MatOfPoint2f();
+                    Imgproc.approxPolyDP(hull, approx2, 0.04 * peri, true);
+                    Point[] approx2Points = approx2.toArray();
+                    
+                    if (approx2Points.length == 4) {
+                        if (validateAspectRatio(approx2Points, expectedAspectRatio)) {
+                            bestQuad = approx2Points;
+                            found = true;
+                            Log.d(TAG, "✅ Found valid 4-point document contour with relaxed approximation");
+                            approx2.release();
+                            break;
+                        }
+                    }
+                    
+                    // Try bounding rectangle as fallback
+                    RotatedRect rotatedRect = Imgproc.minAreaRect(hull);
+                    Point[] rectPoints = new Point[4];
+                    rotatedRect.points(rectPoints);
+                    
+                    if (validateAspectRatio(rectPoints, expectedAspectRatio)) {
+                        bestQuad = rectPoints;
+                        found = true;
+                        Log.d(TAG, "✅ Found valid document using bounding rectangle");
+                        approx2.release();
+                        break;
+                    }
+                    
+                    approx2.release();
+                    Log.d(TAG, "❌ Bounding rectangle failed aspect ratio validation");
+                }
+                
+                hull.release();
+                approx.release();
+                hullIndices.release();
+            }
+
+            // Release contours
+            for (MatOfPoint contour : filteredContours) {
+                contour.release();
+            }
+
+            if (found && bestQuad != null) {
+                Log.d(TAG, "🎯 Document found, performing perspective transformation");
+                
+                // 8. Scale coordinates back to original frame size
+                for (int i = 0; i < 4; i++) {
+                    bestQuad[i].x /= ratio;
+                    bestQuad[i].y /= ratio;
+                    
+                    // If we cropped to scan region, add back the crop offset
+                    if (hasScanRegion && scanRegionWidth > 50 && scanRegionHeight > 50) {
+                        int padding = 50;
+                        int cropX = Math.max(0, (int)(scanRegionX - padding));
+                        int cropY = Math.max(0, (int)(scanRegionY - padding));
+                        bestQuad[i].x += cropX;
+                        bestQuad[i].y += cropY;
+                    }
+                }
+
+                // 9. Perform perspective transformation
+                Mat croppedDocument = performPerspectiveTransform(originalFrame, bestQuad);
+                
+                if (croppedDocument != null && !croppedDocument.empty() && 
+                    croppedDocument.width() > 50 && croppedDocument.height() > 50) {
+                    
+                    Log.d(TAG, "✅ Document extracted successfully: " + croppedDocument.width() + "x" + croppedDocument.height());
+                    
+                    // Convert to base64 and send to React Native
+                    String base64Image = matToBase64(croppedDocument);
+                    
+                    if (base64Image != null && frameListener != null) {
+                        List<Point> corners = Arrays.asList(bestQuad);
+                        frameListener.onDocumentDetected(corners, imageWidth, imageHeight, base64Image);
+                        sendFeedbackIfNeeded("Document detected successfully!");
+                    }
+                    
+                    croppedDocument.release();
+                } else {
+                    Log.w(TAG, "❌ Perspective transformation resulted in invalid document");
+                    sendFeedbackIfNeeded("Failed to extract document. Try adjusting position.");
+                }
+            } else {
+                // No valid document found
+                Log.d(TAG, "❌ No valid document contour found after processing all contours");
+                if (frameListener != null) {
+                    frameListener.onDocumentDetected(null, imageWidth, imageHeight, null);
+                }
+                
+                if (expectedAspectRatio > 0) {
+                    sendFeedbackIfNeeded("Position " + documentType + " within the green rectangle");
+                } else {
+                    sendFeedbackIfNeeded("Position document within the frame");
+                }
+            }
+
+        } catch (Exception e) {
+            Log.e(TAG, "Error in document detection", e);
+            sendFeedbackIfNeeded("Processing error. Please try again.");
+        } finally {
+            // Clean up all Mat objects
+            if (frame != null) frame.release();
+            if (gray != null) gray.release();
+            if (blurred != null) blurred.release();
+            if (edges != null) edges.release();
+            if (kernel != null) kernel.release();
+        }
+    }
+
+    /**
+     * Validate aspect ratio of detected quadrilateral
+     */
+    private boolean validateAspectRatio(Point[] quad, double expectedAspectRatio) {
+        if (expectedAspectRatio <= 0 || quad.length != 4) {
+            return true; // No validation if no expected ratio
+        }
+
+        try {
+            // Calculate average width and height of the quadrilateral
+            double w1 = Math.hypot(quad[1].x - quad[0].x, quad[1].y - quad[0].y);
+            double w2 = Math.hypot(quad[2].x - quad[3].x, quad[2].y - quad[3].y);
+            double h1 = Math.hypot(quad[3].x - quad[0].x, quad[3].y - quad[0].y);
+            double h2 = Math.hypot(quad[2].x - quad[1].x, quad[2].y - quad[1].y);
+            
+            double avgWidth = (w1 + w2) / 2.0;
+            double avgHeight = (h1 + h2) / 2.0;
+            
+            if (avgHeight == 0) return false;
+            
+            double detectedAspectRatio = avgWidth / avgHeight;
+            double tolerance = 0.25 * expectedAspectRatio; // 25% tolerance for better real-world performance
+            
+            boolean isValid = Math.abs(detectedAspectRatio - expectedAspectRatio) < tolerance;
+            
+            Log.d(TAG, String.format("Aspect ratio validation: detected=%.3f, expected=%.3f, tolerance=%.3f, valid=%s",
+                    detectedAspectRatio, expectedAspectRatio, tolerance, isValid));
+            
+            return isValid;
+        } catch (Exception e) {
+            Log.e(TAG, "Error validating aspect ratio", e);
+            return false;
+        }
+    }
+
+    /**
+     * Perform perspective transformation on detected document
+     */
+    private Mat performPerspectiveTransform(Mat originalFrame, Point[] quad) {
+        if (quad == null || quad.length != 4) {
+            Log.e(TAG, "Invalid quad for perspective transformation");
+            return null;
+        }
+
+        try {
+            // Order points: top-left, top-right, bottom-right, bottom-left
+            Point[] orderedQuad = orderPoints(quad);
+            
+            // Calculate output dimensions
+            double w1 = Math.hypot(orderedQuad[1].x - orderedQuad[0].x, orderedQuad[1].y - orderedQuad[0].y);
+            double w2 = Math.hypot(orderedQuad[2].x - orderedQuad[3].x, orderedQuad[2].y - orderedQuad[3].y);
+            double h1 = Math.hypot(orderedQuad[3].x - orderedQuad[0].x, orderedQuad[3].y - orderedQuad[0].y);
+            double h2 = Math.hypot(orderedQuad[2].x - orderedQuad[1].x, orderedQuad[2].y - orderedQuad[1].y);
+            
+            double maxWidth = Math.max(w1, w2);
+            double maxHeight = Math.max(h1, h2);
+            
+            // Ensure minimum dimensions and reasonable maximum
+            maxWidth = Math.max(maxWidth, 100);
+            maxHeight = Math.max(maxHeight, 100);
+            maxWidth = Math.min(maxWidth, originalFrame.width());
+            maxHeight = Math.min(maxHeight, originalFrame.height());
+            
+            // If expected aspect ratio is available, use it to correct dimensions
+            if (expectedAspectRatio > 0) {
+                double currentAspectRatio = maxWidth / maxHeight;
+                double tolerance = 0.1; // 10% tolerance for dimension correction
+                
+                if (Math.abs(currentAspectRatio - expectedAspectRatio) > tolerance) {
+                    if (currentAspectRatio > expectedAspectRatio) {
+                        // Too wide, adjust width
+                        maxWidth = maxHeight * expectedAspectRatio;
+                    } else {
+                        // Too tall, adjust height
+                        maxHeight = maxWidth / expectedAspectRatio;
+                    }
+                }
+            }
+            
+            Log.d(TAG, String.format("Perspective transform dimensions: %.0fx%.0f", maxWidth, maxHeight));
+            
+            // Source points
+            Mat srcPoints = new Mat(4, 1, CvType.CV_32FC2);
+            for (int i = 0; i < 4; i++) {
+                srcPoints.put(i, 0, orderedQuad[i].x, orderedQuad[i].y);
+            }
+            
+            // Destination points (rectangle)
+            Mat dstPoints = new Mat(4, 1, CvType.CV_32FC2);
+            dstPoints.put(0, 0, 0, 0);
+            dstPoints.put(1, 0, maxWidth - 1, 0);
+            dstPoints.put(2, 0, maxWidth - 1, maxHeight - 1);
+            dstPoints.put(3, 0, 0, maxHeight - 1);
+            
+            // Get perspective transform matrix
+            Mat transformMatrix = Imgproc.getPerspectiveTransform(srcPoints, dstPoints);
+            
+            // Apply transformation
+            Mat warped = new Mat();
+            Imgproc.warpPerspective(originalFrame, warped, transformMatrix, new Size(maxWidth, maxHeight));
+            
+            // Clean up
+            srcPoints.release();
+            dstPoints.release();
+            transformMatrix.release();
+            
+            // Validate output
+            if (warped.width() < 50 || warped.height() < 50) {
+                Log.w(TAG, "Perspective transformation resulted in too small image: " + warped.width() + "x" + warped.height());
+                warped.release();
+                return null;
+            }
+            
+            return warped;
+            
+        } catch (Exception e) {
+            Log.e(TAG, "Error in perspective transformation", e);
+            return null;
+        }
+    }
+
+    /**
+     * Order points as: top-left, top-right, bottom-right, bottom-left
+     */
+    private Point[] orderPoints(Point[] pts) {
+        Point[] rect = new Point[4];
+        
+        // Sum of coordinates
+        double[] sums = new double[4];
+        double[] diffs = new double[4];
+        
+        for (int i = 0; i < 4; i++) {
+            sums[i] = pts[i].x + pts[i].y;
+            diffs[i] = pts[i].x - pts[i].y;
+        }
+        
+        // Top-left has smallest sum
+        int topLeftIdx = 0;
+        for (int i = 1; i < 4; i++) {
+            if (sums[i] < sums[topLeftIdx]) {
+                topLeftIdx = i;
+            }
+        }
+        rect[0] = pts[topLeftIdx];
+        
+        // Bottom-right has largest sum
+        int bottomRightIdx = 0;
+        for (int i = 1; i < 4; i++) {
+            if (sums[i] > sums[bottomRightIdx]) {
+                bottomRightIdx = i;
+            }
+        }
+        rect[2] = pts[bottomRightIdx];
+        
+        // Top-right has smallest difference
+        int topRightIdx = 0;
+        for (int i = 1; i < 4; i++) {
+            if (diffs[i] < diffs[topRightIdx]) {
+                topRightIdx = i;
+            }
+        }
+        rect[1] = pts[topRightIdx];
+        
+        // Bottom-left has largest difference
+        int bottomLeftIdx = 0;
+        for (int i = 1; i < 4; i++) {
+            if (diffs[i] > diffs[bottomLeftIdx]) {
+                bottomLeftIdx = i;
+            }
+        }
+        rect[3] = pts[bottomLeftIdx];
+        
+        return rect;
+    }
+
+    private void saveCroppedMat(Mat processFrame) {
+        try {
+            File outputDir = getContext().getExternalFilesDir(Environment.DIRECTORY_PICTURES);
+            if (outputDir != null && !outputDir.exists()) {
+                outputDir.mkdirs();
+            }
+
+            String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(new Date());
+            File imageFile = new File(outputDir, "cropped_" + timeStamp + ".jpg");
+
+            boolean saved = Imgcodecs.imwrite(imageFile.getAbsolutePath(), processFrame);
+            if (saved) {
+                Log.d(TAG, "Saved cropped image to: " + imageFile.getAbsolutePath());
+            } else {
+                Log.e(TAG, "Failed to save cropped image.");
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error saving image: " + e.getMessage());
+        }
+    }
+
+    private String matToBase64(Mat mat) {
+        try {
+            if (mat == null || mat.empty()) {
+                Log.e(TAG, "Cannot encode null or empty Mat to base64");
+                return null;
+            }
+
+            Log.d(TAG, String.format("Encoding Mat to base64: %dx%d, type: %d",
+                    mat.width(), mat.height(), mat.type()));
+
+            // The mat should already be in RGB format
+            MatOfByte buffer = new MatOfByte();
+
+            // Use JPEG with quality setting for smaller file size and better memory
+            // management
+            MatOfInt params = new MatOfInt(Imgcodecs.IMWRITE_JPEG_QUALITY, 85); // 85% quality
+            boolean success = Imgcodecs.imencode(".jpg", mat, buffer, params);
+
+            if (!success) {
+                Log.e(TAG, "Failed to encode Mat to JPEG format");
+                buffer.release();
+                params.release();
+                return null;
+            }
+
+            byte[] bytes = buffer.toArray();
+            buffer.release();
+            params.release();
+
+            if (bytes == null || bytes.length == 0) {
+                Log.e(TAG, "Encoded bytes are null or empty");
+                return null;
+            }
+
+            Log.d(TAG, String.format("Successfully encoded image: %d bytes", bytes.length));
+            return Base64.encodeToString(bytes, Base64.NO_WRAP); // NO_WRAP for cleaner output
+
+        } catch (Exception e) {
+            Log.e(TAG, "Error encoding Mat to base64: " + e.getMessage());
+            e.printStackTrace();
+            return null;
+        }
+    }
+
+    private Mat imageToMat(Image image) {
+        int width = image.getWidth();
+        int height = image.getHeight();
+
+        // Get the YUV data in NV21 format
+        byte[] nv21 = YUV_420_888toNV21(image);
+
+        // Create a Mat from the NV21 data
+        Mat yuvMat = new Mat(height + height / 2, width, CvType.CV_8UC1);
+        yuvMat.put(0, 0, nv21);
+
+        // Convert YUV to RGB
+        Mat rgbMat = new Mat();
+        Imgproc.cvtColor(yuvMat, rgbMat, Imgproc.COLOR_YUV2RGB_NV21);
+
+        yuvMat.release();
+
+        return rgbMat;
+    }
+
+    private byte[] YUV_420_888toNV21(Image image) {
+        int width = image.getWidth();
+        int height = image.getHeight();
+
+        Image.Plane[] planes = image.getPlanes();
+        byte[] data = new byte[width * height * ImageFormat.getBitsPerPixel(ImageFormat.NV21) / 8];
+        int offset = 0;
+
+        ByteBuffer yBuffer = planes[0].getBuffer();
+        int yRowStride = planes[0].getRowStride();
+        int yPixelStride = planes[0].getPixelStride();
+
+        ByteBuffer uBuffer = planes[1].getBuffer();
+        ByteBuffer vBuffer = planes[2].getBuffer();
+        int uvRowStride = planes[1].getRowStride();
+        int uvPixelStride = planes[1].getPixelStride();
+
+        int ySize = yBuffer.remaining();
+        yBuffer.get(data, 0, ySize);
+        offset += ySize;
+
+        byte[] uData = new byte[uBuffer.remaining()];
+        uBuffer.get(uData);
+        byte[] vData = new byte[vBuffer.remaining()];
+        vBuffer.get(vData);
+
+        for (int row = 0; row < height / 2; row++) {
+            int uvRowStart = row * uvRowStride;
+
+            for (int col = 0; col < width / 2; col++) {
+                int uvPixelOffset = uvRowStart + col * uvPixelStride;
+
+                data[offset++] = uData[uvPixelOffset]; // U (Cr)
+                data[offset++] = vData[uvPixelOffset]; // V (Cb)
+            }
+        }
+
+        return data;
+    }
+
+    // Implement the required methods of TextureView.SurfaceTextureListener
+
+    @Override
+    public void onSurfaceTextureAvailable(@NonNull SurfaceTexture surface, int width, int height) {
+        openCamera();
+    }
+
+    @Override
+    public void onSurfaceTextureSizeChanged(@NonNull SurfaceTexture surface, int width, int height) {
+        // Handle size changes if needed
+    }
+
+    @Override
+    public boolean onSurfaceTextureDestroyed(@NonNull SurfaceTexture surface) {
+        closeCamera();
+        return true;
+    }
+
+    @Override
+    public void onSurfaceTextureUpdated(@NonNull SurfaceTexture surface) {
+        // Called every time there's a new Camera preview frame
+        // Send overlay coordinates to React Native for display
+        sendOverlayCoordinates();
+    }
+
+    // Throttle overlay updates to avoid spam
+    private long lastOverlaySentTime = 0;
+    private static final long OVERLAY_UPDATE_INTERVAL_MS = 500; // Send overlay updates every 500ms
+
+    /**
+     * Send overlay coordinates to React Native for display
+     */
+    private void sendOverlayCoordinates() {
+        if (!showRectangleOverlay || !hasScanRegion || scanRegionWidth <= 0 || scanRegionHeight <= 0) {
+            return;
+        }
+
+        // Throttle updates to avoid spamming React Native
+        long currentTime = System.currentTimeMillis();
+        if (currentTime - lastOverlaySentTime < OVERLAY_UPDATE_INTERVAL_MS) {
+            return;
+        }
+
+        try {
+            // Get the view dimensions
+            int viewWidth = getWidth();
+            int viewHeight = getHeight();
+
+            if (viewWidth <= 0 || viewHeight <= 0 || frameListener == null)
+                return;
+
+            // Get actual frame dimensions accounting for rotation
+            int rotation = getImageRotation();
+            double frameWidth, frameHeight;
+            if (rotation == 90 || rotation == 270) {
+                frameWidth = imageHeight;
+                frameHeight = imageWidth;
+            } else {
+                frameWidth = imageWidth;
+                frameHeight = imageHeight;
+            }
+            
+            // Scale the scan region coordinates from frame space to view space
+            double scaleX = (double) viewWidth / frameWidth;
+            double scaleY = (double) viewHeight / frameHeight;
+
+            // Calculate scaled rectangle position for React Native overlay
+            double left = scanRegionX * scaleX;
+            double top = scanRegionY * scaleY;
+            double width = scanRegionWidth * scaleX;
+            double height = scanRegionHeight * scaleY;
+
+            Log.v(TAG, String.format("📱 Sending overlay coords: view=%dx%d, frame=%.0fx%.0f (rotation=%d°), scale=%.2fx%.2f",
+                    viewWidth, viewHeight, frameWidth, frameHeight, rotation, scaleX, scaleY));
+            Log.v(TAG, String.format("📱 Overlay rectangle: (%.1f,%.1f,%.1fx%.1f)", left, top, width, height));
+
+            // Send coordinates to React Native via callback
+            if (frameListener != null) {
+                try {
+                    frameListener.onOverlayUpdate(left, top, width, height);
+                    lastOverlaySentTime = currentTime;
+                    Log.d(TAG, "✅ Overlay coordinates sent to React Native");
+                } catch (Exception e) {
+                    Log.e(TAG, "❌ Error calling onOverlayUpdate", e);
+                }
+            }
+
+        } catch (Exception e) {
+            Log.e(TAG, "Error sending overlay coordinates", e);
+        }
+    }
+}
