@@ -125,7 +125,7 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
     private boolean enableBlurDetection = true; // Enable blur detection
     private double blurThreshold = 100.0; // Laplacian variance threshold for blur detection
     private int blurDetectionCount = 0; // Count of consecutive blur detections
-    private static final int MAX_BLUR_COUNT = 3; // Max consecutive blur detections before feedback
+    private static final int MAX_BLUR_COUNT = 3; // Consecutive blur detections before filtering
 
 
 
@@ -733,7 +733,6 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
                         // Final blur check before capture
                         if (isImageBlurry(originalFrame)) {
                             Log.w(TAG, "⚠️ Final blur check failed, skipping capture");
-                            sendFeedbackIfNeeded("Image is blurry. Please hold the camera steady.");
                             numOfSquares = Math.max(0, numOfSquares - 2); // Decrement more for blur
                             return;
                         }
@@ -3711,6 +3710,8 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
         Log.d(TAG, "Blur detection set to: " + this.enableBlurDetection);
     }
     
+
+    
     /**
      * Set blur detection threshold (lower = more sensitive to blur)
      * @param threshold Laplacian variance threshold (default: 100.0)
@@ -3779,10 +3780,7 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
             if (isBlurry) {
                 blurDetectionCount++;
                 Log.d(TAG, "Blur detected! Count: " + blurDetectionCount + "/" + MAX_BLUR_COUNT);
-                
-                if (blurDetectionCount >= MAX_BLUR_COUNT) {
-                    sendFeedbackIfNeeded("Image is blurry. Please hold the camera steady.");
-                }
+                // No feedback message - just silently filter blurry images
             } else {
                 blurDetectionCount = 0; // Reset counter for sharp images
             }
