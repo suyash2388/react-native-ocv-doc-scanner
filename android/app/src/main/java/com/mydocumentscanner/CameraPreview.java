@@ -129,7 +129,7 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
     
     // Manual cropping settings
     private int detectionFailureCount = 0; // Count of consecutive detection failures
-    private static final int MAX_DETECTION_FAILURES = 5; // Max failures before offering manual crop
+    private static final int MAX_DETECTION_FAILURES = 15; // Max failures before offering manual crop (increased from 5)
     private boolean manualCropMode = false; // Whether in manual cropping mode
     private Mat lastProcessedFrame = null; // Store the last processed frame for manual cropping
 
@@ -3652,13 +3652,23 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
      */
     private Mat performSimplePerspectiveTransform(Mat originalFrame, Point[] corners) {
         Log.d(TAG, "🔄 Performing simple perspective transform");
+        Log.d(TAG, "📷 Source frame: " + originalFrame.width() + "x" + originalFrame.height());
         
         try {
+            // Log the corners being used for transformation
+            Log.d(TAG, "📍 Transform corners:");
+            Log.d(TAG, "  TL: (" + corners[0].x + ", " + corners[0].y + ")");
+            Log.d(TAG, "  TR: (" + corners[1].x + ", " + corners[1].y + ")");
+            Log.d(TAG, "  BR: (" + corners[2].x + ", " + corners[2].y + ")");
+            Log.d(TAG, "  BL: (" + corners[3].x + ", " + corners[3].y + ")");
+            
             // Calculate output dimensions based on the detected corners
             double width1 = distance(corners[0], corners[1]);
             double width2 = distance(corners[2], corners[3]);
             double height1 = distance(corners[1], corners[2]);
             double height2 = distance(corners[3], corners[0]);
+            
+            Log.d(TAG, "📏 Calculated dimensions: width1=" + width1 + ", width2=" + width2 + ", height1=" + height1 + ", height2=" + height2);
             
             int outputWidth = (int) Math.max(width1, width2);
             int outputHeight = (int) Math.max(height1, height2);
@@ -3666,6 +3676,8 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
             // Ensure minimum size
             outputWidth = Math.max(outputWidth, 400);
             outputHeight = Math.max(outputHeight, 300);
+            
+            Log.d(TAG, "📦 Output dimensions: " + outputWidth + "x" + outputHeight);
             
             // Define destination points (rectangle)
             Point[] dst = new Point[4];
@@ -3879,11 +3891,17 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
             Log.i(TAG, "🔧 Preparing manual cropping mode");
             manualCropMode = true;
             
+            // Store this exact frame for manual cropping to ensure consistency
+            if (lastProcessedFrame != null) {
+                lastProcessedFrame.release();
+            }
+            lastProcessedFrame = frame.clone();
+            
             // Convert frame to base64 for React Native
             String frameBase64 = matToBase64(frame);
             
             if (frameListener != null && frameBase64 != null) {
-                Log.i(TAG, "📷 Sending frame to React Native for manual cropping");
+                Log.i(TAG, "📷 Sending frame to React Native for manual cropping: " + frame.width() + "x" + frame.height());
                 frameListener.onManualCropNeeded(frame.width(), frame.height(), frameBase64);
             }
             
@@ -3899,17 +3917,19 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
     public void processManualCrop(double[] cornerPoints, int frameWidth, int frameHeight) {
         try {
             Log.i(TAG, "🔧 Processing manual crop with " + cornerPoints.length + " corner points");
+            Log.i(TAG, "🔧 Manual crop frame dimensions: " + frameWidth + "x" + frameHeight);
             
             if (cornerPoints.length != 8) {
                 Log.e(TAG, "❌ Invalid corner points count: " + cornerPoints.length + " (expected 8)");
                 return;
             }
             
-            // Convert corner points to OpenCV Points
+            // Convert corner points to OpenCV Points (order: TL, TR, BR, BL)
             Point[] corners = new Point[4];
+            String[] cornerNames = {"TopLeft", "TopRight", "BottomRight", "BottomLeft"};
             for (int i = 0; i < 4; i++) {
                 corners[i] = new Point(cornerPoints[i * 2], cornerPoints[i * 2 + 1]);
-                Log.d(TAG, "📍 Corner " + i + ": (" + corners[i].x + ", " + corners[i].y + ")");
+                Log.d(TAG, "📍 Manual " + cornerNames[i] + " " + i + ": (" + corners[i].x + ", " + corners[i].y + ")");
             }
             
             // Get the current frame for cropping
@@ -3919,13 +3939,26 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
                 return;
             }
             
+            Log.i(TAG, "📷 Current frame dimensions: " + currentFrame.width() + "x" + currentFrame.height());
+            
+            // Order the points properly for perspective transformation
+            Point[] orderedCorners = orderPoints(corners);
+            String[] orderedNames = {"TopLeft", "TopRight", "BottomRight", "BottomLeft"};
+            Log.d(TAG, "📍 Ordered corners after orderPoints():");
+            for (int i = 0; i < orderedCorners.length; i++) {
+                Log.d(TAG, "  " + orderedNames[i] + " " + i + ": (" + orderedCorners[i].x + ", " + orderedCorners[i].y + ")");
+            }
+            
             // Perform perspective transformation with manual points
-            Mat croppedDocument = performSimplePerspectiveTransform(currentFrame, corners);
+            Mat croppedDocument = performSimplePerspectiveTransform(currentFrame, orderedCorners);
             String base64Image = null;
             
             if (croppedDocument != null) {
+                Log.i(TAG, "📏 Cropped document dimensions: " + croppedDocument.width() + "x" + croppedDocument.height());
                 base64Image = matToBase64(croppedDocument);
                 croppedDocument.release();
+            } else {
+                Log.e(TAG, "❌ Failed to perform perspective transformation");
             }
             
             // Reset manual crop mode and detection failure count
@@ -3933,7 +3966,7 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
             detectionFailureCount = 0;
             
             // Notify listener with results
-            List<Point> cornersList = Arrays.asList(corners);
+            List<Point> cornersList = Arrays.asList(orderedCorners);
             if (frameListener != null) {
                 frameListener.onDocumentDetected(cornersList, currentFrame.width(), 
                     currentFrame.height(), base64Image);
@@ -3942,7 +3975,7 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
             Log.i(TAG, "✅ Manual cropping completed successfully");
             
         } catch (Exception e) {
-            Log.e(TAG, "Error processing manual crop: " + e.getMessage());
+            Log.e(TAG, "Error processing manual crop: " + e.getMessage(), e);
             manualCropMode = false;
         }
     }

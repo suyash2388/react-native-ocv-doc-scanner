@@ -1,6 +1,6 @@
 /* eslint-disable prettier/prettier */
 
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useCallback } from 'react';
 import {
   View,
   Text,
@@ -10,6 +10,7 @@ import {
   StyleSheet,
   Dimensions,
 } from 'react-native';
+import Svg, { Polygon } from 'react-native-svg';
 
 const { width: windowWidth, height: windowHeight } = Dimensions.get('window');
 
@@ -36,39 +37,41 @@ const ManualCropOverlay = ({
     bottomRight: { x: frameWidth * 0.9, y: frameHeight * 0.9 },
   });
 
-  // Create pan responder for corner dragging
-  const createPanResponder = (cornerKey) => {
-    return PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder: () => true,
-      onPanResponderMove: (evt, gestureState) => {
-        const { dx, dy } = gestureState;
-        
-        setCorners(prevCorners => {
-          const currentCorner = prevCorners[cornerKey];
-          
-          // Convert touch coordinates to frame coordinates
-          const frameX = currentCorner.x + (dx / scale);
-          const frameY = currentCorner.y + (dy / scale);
-          
-          // Constrain to frame bounds
-          const constrainedX = Math.max(0, Math.min(frameWidth, frameX));
-          const constrainedY = Math.max(0, Math.min(frameHeight, frameY));
-          
-          return {
-            ...prevCorners,
-            [cornerKey]: { x: constrainedX, y: constrainedY },
-          };
-        });
-      },
-    });
-  };
+  // Store refs for each corner's start position
+  const startPositions = useRef({});
 
-  // Pan responders for each corner
-  const topLeftPanResponder = createPanResponder('topLeft');
-  const topRightPanResponder = createPanResponder('topRight');
-  const bottomLeftPanResponder = createPanResponder('bottomLeft');
-  const bottomRightPanResponder = createPanResponder('bottomRight');
+  // Create individual pan responders for each corner
+  const createCornerPanResponder = (cornerKey) => PanResponder.create({
+    onStartShouldSetPanResponder: () => true,
+    onMoveShouldSetPanResponder: () => true,
+    onPanResponderGrant: () => {
+      startPositions.current[cornerKey] = { ...corners[cornerKey] };
+    },
+    onPanResponderMove: (evt, gestureState) => {
+      const { dx, dy } = gestureState;
+      const startPos = startPositions.current[cornerKey];
+      
+      if (!startPos) return;
+      
+      // Calculate new position based on start position + delta
+      const frameX = startPos.x + (dx / scale);
+      const frameY = startPos.y + (dy / scale);
+      
+      // Constrain to frame bounds
+      const constrainedX = Math.max(0, Math.min(frameWidth, frameX));
+      const constrainedY = Math.max(0, Math.min(frameHeight, frameY));
+      
+      setCorners(prevCorners => ({
+        ...prevCorners,
+        [cornerKey]: { x: constrainedX, y: constrainedY },
+      }));
+    },
+  });
+
+  const topLeftPanResponder = createCornerPanResponder('topLeft');
+  const topRightPanResponder = createCornerPanResponder('topRight');
+  const bottomLeftPanResponder = createCornerPanResponder('bottomLeft');
+  const bottomRightPanResponder = createCornerPanResponder('bottomRight');
 
   const handleConfirm = () => {
     // Extract corner coordinates in the order expected by native code
@@ -78,6 +81,15 @@ const ManualCropOverlay = ({
       corners.bottomRight.x, corners.bottomRight.y,
       corners.bottomLeft.x, corners.bottomLeft.y,
     ];
+    
+    console.log('🔧 ManualCropOverlay - Sending corners:', {
+      topLeft: `(${corners.topLeft.x.toFixed(1)}, ${corners.topLeft.y.toFixed(1)})`,
+      topRight: `(${corners.topRight.x.toFixed(1)}, ${corners.topRight.y.toFixed(1)})`,
+      bottomRight: `(${corners.bottomRight.x.toFixed(1)}, ${corners.bottomRight.y.toFixed(1)})`,
+      bottomLeft: `(${corners.bottomLeft.x.toFixed(1)}, ${corners.bottomLeft.y.toFixed(1)})`,
+      frameSize: `${frameWidth}x${frameHeight}`,
+      scale: scale.toFixed(3)
+    });
     
     onCropConfirm(cornerArray, frameWidth, frameHeight);
   };
@@ -151,7 +163,19 @@ const ManualCropOverlay = ({
           ]}
         />
 
-        {/* Overlay lines connecting corners would go here */}
+        {/* SVG overlay for connecting lines */}
+        <Svg 
+          style={styles.svgOverlay} 
+          width={frameWidth * scale} 
+          height={frameHeight * scale}
+        >
+          <Polygon
+            points={`${corners.topLeft.x * scale},${corners.topLeft.y * scale} ${corners.topRight.x * scale},${corners.topRight.y * scale} ${corners.bottomRight.x * scale},${corners.bottomRight.y * scale} ${corners.bottomLeft.x * scale},${corners.bottomLeft.y * scale}`}
+            fill="rgba(0, 255, 0, 0.2)"
+            stroke="rgba(0, 255, 0, 0.8)"
+            strokeWidth="2"
+          />
+        </Svg>
       </View>
 
       <View style={styles.buttonContainer}>
@@ -209,6 +233,12 @@ const styles = StyleSheet.create({
     borderColor: 'white',
     justifyContent: 'center',
     alignItems: 'center',
+  },
+  svgOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    pointerEvents: 'none', // Allow touches to pass through to corner handles
   },
   topLeft: {
     // Additional styling if needed

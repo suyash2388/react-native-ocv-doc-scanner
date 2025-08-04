@@ -330,7 +330,16 @@ const App = () => {
   }, []);
 
   const handleManualCropConfirm = useCallback((cornerPoints: number[], frameWidth: number, frameHeight: number) => {
-    console.log('✅ Manual crop confirmed:', cornerPoints);
+    console.log('✅ Manual crop confirmed - App.tsx:', {
+      cornerPoints,
+      frameSize: `${frameWidth}x${frameHeight}`,
+      coordinates: {
+        topLeft: `(${cornerPoints[0]?.toFixed(1)}, ${cornerPoints[1]?.toFixed(1)})`,
+        topRight: `(${cornerPoints[2]?.toFixed(1)}, ${cornerPoints[3]?.toFixed(1)})`,
+        bottomRight: `(${cornerPoints[4]?.toFixed(1)}, ${cornerPoints[5]?.toFixed(1)})`,
+        bottomLeft: `(${cornerPoints[6]?.toFixed(1)}, ${cornerPoints[7]?.toFixed(1)})`,
+      }
+    });
     
     if (cameraViewRef.current) {
       cameraViewRef.current.processManualCrop(cornerPoints, frameWidth, frameHeight);
