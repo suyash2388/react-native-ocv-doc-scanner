@@ -126,6 +126,12 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
     private double blurThreshold = 100.0; // Laplacian variance threshold for blur detection
     private int blurDetectionCount = 0; // Count of consecutive blur detections
     private static final int MAX_BLUR_COUNT = 3; // Consecutive blur detections before filtering
+    
+    // Manual cropping settings
+    private int detectionFailureCount = 0; // Count of consecutive detection failures
+    private static final int MAX_DETECTION_FAILURES = 5; // Max failures before offering manual crop
+    private boolean manualCropMode = false; // Whether in manual cropping mode
+    private Mat lastProcessedFrame = null; // Store the last processed frame for manual cropping
 
 
 
@@ -141,6 +147,8 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
         
         void onDocumentContoursDetected(@Nullable List<Point> bestContour, @Nullable List<List<Point>> allValidContours, 
                 int frameWidth, int frameHeight);
+                
+        void onManualCropNeeded(int frameWidth, int frameHeight, String frameImageBase64);
     }
 
     private FrameListener frameListener;
@@ -700,6 +708,12 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
             
             Log.d(TAG, "📐 Processing frame: " + frame.width() + "x" + frame.height() + " (ratio: " + ratio + ")");
 
+            // Store frame for potential manual cropping
+            if (lastProcessedFrame != null) {
+                lastProcessedFrame.release();
+            }
+            lastProcessedFrame = originalFrame.clone();
+
             // 3. Ultra-fast document detection
             Log.d(TAG, "⚡ Using ultra-fast document detection");
             
@@ -717,11 +731,15 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
                     if (isImageBlurry(originalFrame)) {
                         Log.w(TAG, "⚠️ Blurry image detected, skipping detection");
                         numOfSquares = Math.max(0, numOfSquares - 1); // Decrement count for blur
+                        sendFeedbackIfNeeded("Image is blurry. Please hold the camera steady and ensure good lighting.");
                         return; // Skip processing blurry images
                     }
                     
                     // Reset blur counter for sharp images
                     blurDetectionCount = 0;
+                    
+                    // Reset detection failure counter on successful detection
+                    detectionFailureCount = 0;
                     
                     numOfSquares++; // Increment detection count
                     Log.d(TAG, "✅ Document detected! Count: " + numOfSquares + "/" + numOfRectangles);
@@ -734,6 +752,7 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
                         if (isImageBlurry(originalFrame)) {
                             Log.w(TAG, "⚠️ Final blur check failed, skipping capture");
                             numOfSquares = Math.max(0, numOfSquares - 2); // Decrement more for blur
+                            sendFeedbackIfNeeded("Image is blurry. Please hold the camera steady for a clear capture.");
                             return;
                         }
                         
@@ -772,12 +791,23 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
                     // Only decrement if we've had several consecutive invalid detections
                     numOfSquares = Math.max(0, numOfSquares - 1);
                     Log.w(TAG, "⚠️ Invalid quadrilateral detected, count: " + numOfSquares);
+                    sendFeedbackIfNeeded("Document shape not recognized. Please ensure the document is fully visible and has clear edges.");
                 }
             } else {
                 // Only decrement every few frames to maintain stability
                 if (numOfSquares > 0) {
                     numOfSquares = Math.max(0, numOfSquares - 1);
                     Log.d(TAG, "📉 No document found, count: " + numOfSquares);
+                }
+                
+                // Increment detection failure counter
+                detectionFailureCount++;
+                Log.d(TAG, "🔄 Detection failure count: " + detectionFailureCount + "/" + MAX_DETECTION_FAILURES);
+                
+                // Offer manual cropping after repeated failures
+                if (detectionFailureCount >= MAX_DETECTION_FAILURES && !manualCropMode) {
+                    Log.i(TAG, "🔧 Offering manual cropping after " + detectionFailureCount + " failures");
+                    offerManualCropping(originalFrame);
                 }
                 
                 // Clear overlay only if no detections for a while
@@ -3479,7 +3509,7 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
         Mat thresh = null;
         
         try {
-            // 1. Convert to grayscale (fastest approach)
+            // 1. Convert to grayscale
             gray = new Mat();
             if (frame.channels() == 3) {
                 Imgproc.cvtColor(frame, gray, Imgproc.COLOR_BGR2GRAY);
@@ -3487,7 +3517,7 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
                 gray = frame.clone();
             }
             
-            // 2. Simple thresholding (much faster than Canny)
+            // 2. Otsu thresholding
             thresh = new Mat();
             Imgproc.threshold(gray, thresh, 0, 255, Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU);
             
@@ -3496,22 +3526,28 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
             Imgproc.findContours(thresh, contours, new Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
             
             if (contours.isEmpty()) {
+                // No contours found - document not in view
+                // sendFeedbackIfNeeded("No document detected. Please place a document in the camera view.");
                 return null;
             }
             
             // 4. Find largest contour (simple and fast)
             MatOfPoint largestContour = null;
             double maxArea = 0;
+            boolean foundLargeContour = false;
             
             for (MatOfPoint contour : contours) {
                 double area = Imgproc.contourArea(contour);
                 if (area > maxArea && area > width * height * 0.15) { // At least 15% of frame
                     maxArea = area;
                     largestContour = contour;
+                    foundLargeContour = true;
                 }
             }
             
             if (largestContour == null) {
+                // Contours found but none are large enough - document too small or not properly positioned
+                // sendFeedbackIfNeeded("Document too small or not properly positioned. Please move the document closer to the camera.");
                 return null;
             }
             
@@ -3538,16 +3574,18 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
                 approx.release();
                 
                 return orderedPoints;
+            } else {
+                // Contour found but not quadrilateral - document edges not clear
+                // sendFeedbackIfNeeded("Document edges not clear. Please ensure the document is flat and well-lit.");
+                contour2f.release();
+                approx2f.release();
+                approx.release();
+                return null;
             }
-            
-            contour2f.release();
-            approx2f.release();
-            approx.release();
-            
-            return null;
             
         } catch (Exception e) {
             Log.e(TAG, "Error in fast document detection", e);
+            // sendFeedbackIfNeeded("Processing error. Please try again.");
             return null;
         } finally {
             if (gray != null) gray.release();
@@ -3830,6 +3868,95 @@ public class CameraPreview extends TextureView implements TextureView.SurfaceTex
         } catch (Exception e) {
             Log.e(TAG, "Error fixing image orientation: " + e.getMessage());
             return inputImage; // Return original if correction fails
+        }
+    }
+    
+    /**
+     * Offers manual cropping when automatic detection fails repeatedly
+     */
+    private void offerManualCropping(Mat frame) {
+        try {
+            Log.i(TAG, "🔧 Preparing manual cropping mode");
+            manualCropMode = true;
+            
+            // Convert frame to base64 for React Native
+            String frameBase64 = matToBase64(frame);
+            
+            if (frameListener != null && frameBase64 != null) {
+                Log.i(TAG, "📷 Sending frame to React Native for manual cropping");
+                frameListener.onManualCropNeeded(frame.width(), frame.height(), frameBase64);
+            }
+            
+        } catch (Exception e) {
+            Log.e(TAG, "Error offering manual cropping: " + e.getMessage());
+            manualCropMode = false;
+        }
+    }
+    
+    /**
+     * Processes manual cropping with user-defined points
+     */
+    public void processManualCrop(double[] cornerPoints, int frameWidth, int frameHeight) {
+        try {
+            Log.i(TAG, "🔧 Processing manual crop with " + cornerPoints.length + " corner points");
+            
+            if (cornerPoints.length != 8) {
+                Log.e(TAG, "❌ Invalid corner points count: " + cornerPoints.length + " (expected 8)");
+                return;
+            }
+            
+            // Convert corner points to OpenCV Points
+            Point[] corners = new Point[4];
+            for (int i = 0; i < 4; i++) {
+                corners[i] = new Point(cornerPoints[i * 2], cornerPoints[i * 2 + 1]);
+                Log.d(TAG, "📍 Corner " + i + ": (" + corners[i].x + ", " + corners[i].y + ")");
+            }
+            
+            // Get the current frame for cropping
+            Mat currentFrame = getCurrentFrame();
+            if (currentFrame == null) {
+                Log.e(TAG, "❌ No current frame available for manual cropping");
+                return;
+            }
+            
+            // Perform perspective transformation with manual points
+            Mat croppedDocument = performSimplePerspectiveTransform(currentFrame, corners);
+            String base64Image = null;
+            
+            if (croppedDocument != null) {
+                base64Image = matToBase64(croppedDocument);
+                croppedDocument.release();
+            }
+            
+            // Reset manual crop mode and detection failure count
+            manualCropMode = false;
+            detectionFailureCount = 0;
+            
+            // Notify listener with results
+            List<Point> cornersList = Arrays.asList(corners);
+            if (frameListener != null) {
+                frameListener.onDocumentDetected(cornersList, currentFrame.width(), 
+                    currentFrame.height(), base64Image);
+            }
+            
+            Log.i(TAG, "✅ Manual cropping completed successfully");
+            
+        } catch (Exception e) {
+            Log.e(TAG, "Error processing manual crop: " + e.getMessage());
+            manualCropMode = false;
+        }
+    }
+    
+    /**
+     * Gets the current camera frame for manual cropping
+     */
+    private Mat getCurrentFrame() {
+        if (lastProcessedFrame != null) {
+            Log.d(TAG, "✅ Returning last processed frame for manual cropping");
+            return lastProcessedFrame.clone();
+        } else {
+            Log.w(TAG, "⚠️ No last processed frame available for manual cropping");
+            return null;
         }
     }
 }

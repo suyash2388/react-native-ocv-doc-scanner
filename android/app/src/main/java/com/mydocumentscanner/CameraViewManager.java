@@ -26,8 +26,10 @@ public class CameraViewManager extends SimpleViewManager<FrameLayout> {
     public static final int COMMAND_PAUSE_SCANNING = 1;
     public static final int COMMAND_RESUME_SCANNING = 2;
     public static final int COMMAND_SET_EXPECTED_RATIO = 3;
+    public static final int COMMAND_PROCESS_MANUAL_CROP = 4;
     public static final String EVENT_ON_FEEDBACK = "onFeedback";
     public static final String EVENT_ON_OVERLAY_UPDATE = "onOverlayUpdate";
+    public static final String EVENT_ON_MANUAL_CROP_NEEDED = "onManualCropNeeded";
     
     // Static reference to current overlay view for real-time updates
     private static OverlayView currentOverlayView;
@@ -43,7 +45,8 @@ public class CameraViewManager extends SimpleViewManager<FrameLayout> {
         return MapBuilder.of(
                 "pauseScanning", COMMAND_PAUSE_SCANNING,
                 "resumeScanning", COMMAND_RESUME_SCANNING,
-                "setExpectedRatio", COMMAND_SET_EXPECTED_RATIO
+                "setExpectedRatio", COMMAND_SET_EXPECTED_RATIO,
+                "processManualCrop", COMMAND_PROCESS_MANUAL_CROP
         );
     }
 
@@ -127,6 +130,27 @@ public class CameraViewManager extends SimpleViewManager<FrameLayout> {
                     Log.e("CameraViewManager", "setExpectedRatio called with insufficient args. Args size: " + (args != null ? args.size() : "null"));
                 }
                 break;
+            case "processManualCrop":
+                Log.d("CameraViewManager", "Executing processManualCrop");
+                if (args != null && args.size() >= 3) {
+                    ReadableArray cornerPoints = args.getArray(0);
+                    int frameWidth = args.getInt(1);
+                    int frameHeight = args.getInt(2);
+                    
+                    if (cornerPoints != null && cornerPoints.size() == 8) {
+                        double[] points = new double[8];
+                        for (int i = 0; i < 8; i++) {
+                            points[i] = cornerPoints.getDouble(i);
+                        }
+                        Log.d("CameraViewManager", "processManualCrop params: frameWidth=" + frameWidth + ", frameHeight=" + frameHeight);
+                        cameraPreview.processManualCrop(points, frameWidth, frameHeight);
+                    } else {
+                        Log.e("CameraViewManager", "processManualCrop called with invalid corner points. Points size: " + (cornerPoints != null ? cornerPoints.size() : "null"));
+                    }
+                } else {
+                    Log.e("CameraViewManager", "processManualCrop called with insufficient args. Args size: " + (args != null ? args.size() : "null"));
+                }
+                break;
             default:
                 Log.w("CameraViewManager", "Unknown command: " + commandId);
                 break;
@@ -138,6 +162,7 @@ public class CameraViewManager extends SimpleViewManager<FrameLayout> {
         return MapBuilder.<String, Object>builder()
                 .put(EVENT_ON_FEEDBACK, MapBuilder.of("registrationName", EVENT_ON_FEEDBACK))
                 .put(EVENT_ON_OVERLAY_UPDATE, MapBuilder.of("registrationName", EVENT_ON_OVERLAY_UPDATE))
+                .put(EVENT_ON_MANUAL_CROP_NEEDED, MapBuilder.of("registrationName", EVENT_ON_MANUAL_CROP_NEEDED))
                 .build();
     }
     
@@ -206,6 +231,18 @@ public class CameraViewManager extends SimpleViewManager<FrameLayout> {
             reactContext
                     .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
                     .emit("onOverlayUpdate", event);
+        }
+        
+        @Override
+        public void onManualCropNeeded(int frameWidth, int frameHeight, String frameImageBase64) {
+            WritableMap event = Arguments.createMap();
+            event.putInt("frameWidth", frameWidth);
+            event.putInt("frameHeight", frameHeight);
+            event.putString("frameImage", frameImageBase64);
+
+            reactContext
+                    .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+                    .emit("onManualCropNeeded", event);
         }
         
         @Override

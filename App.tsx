@@ -20,6 +20,7 @@ import {
 
 import { Picker } from '@react-native-picker/picker';
 import CameraView from './CameraView';
+import ManualCropOverlay from './ManualCropOverlay';
 import {
   ExtractedAadhaarInfo,
 } from './utils/aadhaarProcessor';
@@ -63,6 +64,12 @@ const App = () => {
   const [resultText, setResultText] = useState('');
   const [_extractedAadhaarData, setExtractedAadhaarData] = useState<ExtractedAadhaarInfo | null>(null);
   const [_templateMatchResult, setTemplateMatchResult] = useState<any>(null);
+  const [showManualCrop, setShowManualCrop] = useState(false);
+  const [manualCropData, setManualCropData] = useState<{
+    frameImage: string;
+    frameWidth: number;
+    frameHeight: number;
+  } | null>(null);
 
 
   const cameraViewRef = useRef<CameraViewWithScanning | null>(null);
@@ -312,6 +319,33 @@ const App = () => {
     // Remove feedback messages - let the visual overlay do the work
   }, []);
 
+  const handleManualCropNeeded = useCallback((event: any) => {
+    console.log('🔧 Manual crop needed in App:', event);
+    setManualCropData({
+      frameImage: event.frameImage,
+      frameWidth: event.frameWidth,
+      frameHeight: event.frameHeight,
+    });
+    setShowManualCrop(true);
+  }, []);
+
+  const handleManualCropConfirm = useCallback((cornerPoints: number[], frameWidth: number, frameHeight: number) => {
+    console.log('✅ Manual crop confirmed:', cornerPoints);
+    
+    if (cameraViewRef.current) {
+      cameraViewRef.current.processManualCrop(cornerPoints, frameWidth, frameHeight);
+    }
+    
+    setShowManualCrop(false);
+    setManualCropData(null);
+  }, []);
+
+  const handleManualCropCancel = useCallback(() => {
+    console.log('❌ Manual crop cancelled');
+    setShowManualCrop(false);
+    setManualCropData(null);
+  }, []);
+
   const processDetectedDocument = async (croppedImageBase64: string, frameWidth: number, frameHeight: number) => {
     try {
       setIsLoading(true);
@@ -461,6 +495,7 @@ const App = () => {
             ref={cameraViewRef}
             onDocumentDetected={handleDocumentDetected}
             onDocumentContoursDetected={handleDocumentContoursDetected}
+            onManualCropNeeded={handleManualCropNeeded}
           />
 
           <View style={styles.instructionContainer}>
@@ -622,6 +657,18 @@ const App = () => {
           </View>
         </View>
       </Modal>
+
+      {/* Manual Crop Overlay */}
+      {showManualCrop && manualCropData && (
+        <ManualCropOverlay
+          frameImage={manualCropData.frameImage}
+          frameWidth={manualCropData.frameWidth}
+          frameHeight={manualCropData.frameHeight}
+          onCropConfirm={handleManualCropConfirm}
+          onCancel={handleManualCropCancel}
+          visible={showManualCrop}
+        />
+      )}
     </View>
   );
 };

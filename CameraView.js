@@ -17,6 +17,7 @@ class CameraView extends React.Component {
     this.isReady = false;
     this.documentDetectionListener = null;
     this.documentContoursListener = null;
+    this.manualCropListener = null;
   }
 
   componentDidMount() {
@@ -49,6 +50,12 @@ class CameraView extends React.Component {
       this.onDocumentContoursDetected
     );
 
+    // Listen for manual crop needed events
+    this.manualCropListener = DeviceEventEmitter.addListener(
+      'onManualCropNeeded',
+      this.onManualCropNeeded
+    );
+
     console.log('📡 Document detection listeners set up');
   };
 
@@ -60,6 +67,10 @@ class CameraView extends React.Component {
     if (this.documentContoursListener) {
       this.documentContoursListener.remove();
       this.documentContoursListener = null;
+    }
+    if (this.manualCropListener) {
+      this.manualCropListener.remove();
+      this.manualCropListener = null;
     }
     console.log('📡 Document detection listeners removed');
   };
@@ -82,6 +93,15 @@ class CameraView extends React.Component {
     }
   };
 
+  onManualCropNeeded = (event) => {
+    console.log('🔧 Manual crop needed:', event);
+    
+    // Pass to parent component to show manual cropping UI
+    if (this.props.onManualCropNeeded) {
+      this.props.onManualCropNeeded(event);
+    }
+  };
+
   pauseScanning = () => {
     const viewId = findNodeHandle(this.cameraRef.current);
     UIManager.dispatchViewManagerCommand(viewId, 'pauseScanning', null);
@@ -96,6 +116,15 @@ class CameraView extends React.Component {
     // For now, ignore aspect ratio constraints and enable generic document detection
     console.log('📞 CameraView.setExpectedRatio called - ignoring aspect ratio for generic detection');
     console.log('🎯 Generic document detection enabled - any rectangular document will be detected');
+  };
+
+  processManualCrop = (cornerPoints, frameWidth, frameHeight) => {
+    const viewId = findNodeHandle(this.cameraRef.current);
+    UIManager.dispatchViewManagerCommand(
+      viewId,
+      'processManualCrop',
+      [cornerPoints, frameWidth, frameHeight]
+    );
   };
 
   // New method to set detection sensitivity
